@@ -4,49 +4,26 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"sync"
 	"syscall"
 	"time"
 
-	"github.com/akosmarton/papipes"
 	cast "github.com/barakmich/gochromecast"
-	"github.com/gen2brain/aac-go"
 )
+
+const mimeType = "audio/flac"
 
 type AudioSink struct {
 	sync.Mutex
-	sink      *papipes.Sink
+	sink      *NullSink
 	closechan chan bool
 	subs      []chan []byte
-}
-
-type ChanbufReader struct {
-	c      chan []byte
-	cancel <-chan struct{}
-	buf    []byte
-}
-
-func (cb *ChanbufReader) Read(out []byte) (int, error) {
-	for len(cb.buf) < len(out) {
-		select {
-		case _, ok := <-cb.cancel:
-			if !ok {
-				log.Println("Cancel called")
-			}
-			return 0, io.EOF
-		case buf := <-cb.c:
-			cb.buf = append(cb.buf, buf...)
-		}
-	}
-	n := copy(out, cb.buf)
-	cb.buf = cb.buf[n:]
-	return n, nil
 }
 
 func (a *AudioSink) Close() error {
@@ -61,69 +38,19 @@ func (a *AudioSink) Close() error {
 func (a *AudioSink) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	fmt.Println("Got connection")
 	fmt.Println(r)
-	fmt.Println(r.Header)
-	w.Header().Set("Content-Type", "audio/aac")
-	enc, err := aac.NewEncoder(w, &aac.Options{
-		SampleRate:  44100,
-		NumChannels: 2,
-	})
-	if err != nil {
-		log.Fatal(err)
+	w.Header().Set("Content-Type", mimeType)
+	args := []string{
+		"-f", "pulse", "-i", a.sink.Name + ".monitor", "-copytb", "1", "-f", "flac", "-",
 	}
-	sub := a.subscribe()
-	tr := &ChanbufReader{
-		c:      sub,
-		cancel: r.Cancel,
-	}
-	err = enc.Encode(tr)
+	fmt.Printf("%v\n", args)
+	cmd := exec.Command("ffmpeg", args...)
+	cmd.Stdout = w
+	cmd.Stderr = os.Stdout
+	err := cmd.Run()
 	if err != nil {
 		log.Println("Encoding error:", err)
 	}
-	a.unsubscribe(sub)
 	fmt.Println("Connection done")
-}
-
-func (a *AudioSink) streamAll() {
-	for {
-		select {
-		case <-a.closechan:
-			return
-		default:
-			//fallthrough
-		}
-		buf := make([]byte, 4096)
-		n, err := a.sink.Read(buf)
-		if err != nil {
-			if err == io.EOF {
-				return
-			}
-			log.Println("streamall", err)
-		}
-		for _, c := range a.subs {
-			c <- buf[:n]
-		}
-	}
-}
-
-func (a *AudioSink) subscribe() chan []byte {
-	a.Lock()
-	defer a.Unlock()
-	out := make(chan []byte, 100)
-	a.subs = append(a.subs, out)
-	return out
-}
-
-func (a *AudioSink) unsubscribe(sub chan []byte) error {
-	a.Lock()
-	defer a.Unlock()
-	for i, c := range a.subs {
-		if c == sub {
-			a.subs = append(a.subs[:i], a.subs[i+1:]...)
-			close(sub)
-			return nil
-		}
-	}
-	return errors.New("Couldn't unsubscribe channel")
 }
 
 func GetLocalIP(iface net.Interface) string {
@@ -158,18 +85,18 @@ func main() {
 	defer sink.Close()
 	defer sink.sink.Close()
 	defer close(closer)
-	http.Handle("/stream.aac", sink)
-	hostport := fmt.Sprintf("%s:8080", addr)
-	go http.ListenAndServe(hostport, nil)
+	http.Handle("/stream", sink)
+	hostport := fmt.Sprintf("%s:8884", addr)
+	go http.ListenAndServe(":8884", nil)
 	fmt.Println("Listening on", hostport)
 
+	c := make(chan os.Signal)
+	signal.Notify(c, os.Interrupt, syscall.SIGKILL)
 	device, err := initChromecast(os.Args[1], iface, hostport)
 	if err != nil {
 		log.Print(err)
 		return
 	}
-	c := make(chan os.Signal)
-	signal.Notify(c, os.Interrupt, syscall.SIGKILL)
 	<-c
 	device.QuitApplication(5 * time.Second)
 }
@@ -196,8 +123,8 @@ func initChromecast(name string, iface net.Interface, httpHostPort string) (cast
 		return dev, errors.New("Couldn't find device")
 	}
 	dev.PlayMedia(
-		fmt.Sprintf("http://%s/stream.aac", httpHostPort),
-		"audio/aac",
+		fmt.Sprintf("http://%s/stream", httpHostPort),
+		mimeType,
 		"NONE",
 	)
 	return dev, nil
@@ -232,13 +159,13 @@ func findDevices(iface net.Interface, searchchan chan CastEntry, timeout time.Du
 		searchchan <- m
 	}
 	fmt.Println("Done discovering")
+	close(searchchan)
 }
 
 func makeSink(closer chan bool) (*AudioSink, error) {
-	sink := &papipes.Sink{
-		Filename:                "/tmp/pacc.sock",
-		Name:                    "PACC",
-		UseSystemClockForTiming: true,
+	sink := &NullSink{
+		Name: "PACC",
+		//UseSystemClockForTiming: true,
 	}
 	sink.SetProperty("device.description", "PACC Output")
 	err := sink.Open()
@@ -249,6 +176,5 @@ func makeSink(closer chan bool) (*AudioSink, error) {
 		sink:      sink,
 		closechan: closer,
 	}
-	go out.streamAll()
 	return out, nil
 }
